@@ -106,8 +106,8 @@ agent.on("request", async (request) => {
       console.log("[VERCEL] Received deployment event:", event.type);
       console.log("[VERCEL] Full event payload:", JSON.stringify(event, null, 2));
 
-      // Handle deployment success and error events
-      if (event.type === "deployment.succeeded" || event.type === "deployment.failed" || event.type === "deployment.error") {
+      // Handle deployment error events only
+      if (event.type === "deployment.failed" || event.type === "deployment.error") {
         // Process asynchronously to avoid webhook timeout
         (async () => {
           try {
@@ -120,6 +120,12 @@ agent.on("request", async (request) => {
           const deploymentId = deployment?.id;
           const target = event.payload.target; // Target is at payload.target, not deployment.target
           const environment = target || "preview"; // Default to "preview" if no target
+          
+          // Only notify for production environment errors
+          if (environment !== "production") {
+            console.log(`[VERCEL] Skipping notification for non-production environment: ${environment}`);
+            return;
+          }
           
           console.log("[VERCEL] Extracted data:", {
             projectName,
@@ -168,8 +174,9 @@ agent.on("request", async (request) => {
           }
           
           // Fallback to SLACK_CHANNEL_ID env var if no project-specific config
+          // Supports comma-separated list of channel IDs
           if (notificationChannels.length === 0 && process.env.SLACK_CHANNEL_ID) {
-            notificationChannels = [process.env.SLACK_CHANNEL_ID];
+            notificationChannels = process.env.SLACK_CHANNEL_ID.split(',').map(ch => ch.trim());
           }
           
           if (notificationChannels.length === 0) {
@@ -252,12 +259,35 @@ agent.on("request", async (request) => {
           // Post notification to all configured channels
           for (const channelId of notificationChannels) {
             try {
-              await app.client.chat.postMessage({
+              const result = await app.client.chat.postMessage({
                 channel: channelId,
                 text: `${emoji} Deployment ${status}: ${projectName}`,
                 blocks,
               });
               console.log(`[VERCEL] Sent ${status} notification to ${channelId}`);
+              
+              // For failed deployments, automatically analyze logs in a thread
+              if (!success && result.ts && process.env.VERCEL_TOKEN) {
+                console.log(`[VERCEL] Triggering automatic log analysis in thread`);
+                
+                // Create a chat for this thread and inject a message to analyze logs
+                const chat = await agent.chat.upsert(['vercel-analysis', deploymentId]);
+                await agent.chat.sendMessages(chat.id, [
+                  {
+                    role: 'user',
+                    parts: [
+                      {
+                        type: 'text',
+                        text: `Analyze the deployment logs for ${projectName} deployment ${deploymentId}. Use the get_deployment_logs tool to fetch the logs and provide a detailed analysis of what went wrong.`,
+                      },
+                    ],
+                    metadata: {
+                      channel: channelId,
+                      thread_ts: result.ts,
+                    },
+                  },
+                ]);
+              }
             } catch (postError) {
               console.error(`[VERCEL] Failed to post to channel ${channelId}:`, postError);
             }
@@ -496,9 +526,29 @@ agent.on("chat", async ({ messages }) => {
 
   return streamText({
     model: "anthropic/claude-sonnet-4.5",
-    system: `You are a helpful Slack bot assistant with access to Vercel deployment information.
+    system: `You are a Vercel deployment monitoring bot for Slack. Here's what you do:
 
-When users ask about build failures or deployments, use the deployment tools to retrieve the stored information. The stored data includes: errorSummary (AI-generated summary), rawErrorDetails (full error messages), and buildLogs (complete build output including warnings, errors, and stack traces). You have full access to all build logs and warnings - use them to provide detailed debugging help.
+**Your Purpose:**
+- Monitor Vercel deployments via webhooks
+- Automatically post notifications to Slack when production deployments fail
+- Automatically fetch and analyze build logs in a thread when failures occur
+- Answer questions about deployment errors and build failures
+
+**Your Capabilities:**
+- Receive Vercel webhook events for deployment failures (production only)
+- Post failure notifications to configured Slack channels
+- Automatically analyze logs in a thread reply using AI
+- Fetch detailed build logs on-demand when users ask
+- Store deployment metadata for later queries
+- Support multiple notification channels per project
+
+**How You Work:**
+When a production deployment fails on Vercel, you automatically:
+1. Post a notification with basic error info to the configured channel(s)
+2. Fetch the full build logs from Vercel API
+3. Analyze the logs and post a detailed explanation in a thread
+
+When users ask about build failures or deployments, use the deployment tools to retrieve stored information. The stored data includes: errorSummary (AI-generated summary) and deployment metadata. Use get_deployment_logs to fetch full logs on-demand.
 
 When users say things like "send notifications here" or "notify this channel about deployments", use the configure_notifications tool with the current channel ID (${threadInfo?.channel}) to set up where deployment notifications should be posted for a specific project.`,
     messages: convertToModelMessages(messages, {
