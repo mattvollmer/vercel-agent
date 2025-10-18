@@ -17,6 +17,7 @@ SLACK_SIGNING_SECRET=your-signing-secret
 
 # Vercel
 VERCEL_TOKEN=your-vercel-api-token
+VERCEL_TEAM_ID=your-team-slug  # Required if using a team account
 VERCEL_WEBHOOK_SECRET=your-webhook-secret
 
 # Notifications (comma-separated for multiple channels)

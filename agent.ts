@@ -352,22 +352,82 @@ agent.on("chat", async ({ messages }) => {
       },
     }),
     list_recent_deployments: tool({
-      description: "List recent deployments across all projects",
+      description: "List recent deployments from Vercel API. Use this when users ask 'show me recent deployments' or 'what are the latest deployments'. If no project specified, shows all projects.",
       inputSchema: z.object({
+        projectName: z.string().optional().describe("Optional: filter by project name (e.g., 'coder.com')"),
         limit: z.number().optional().describe("Maximum number of deployments to return (default: 10)"),
       }),
-      execute: async ({ limit = 10 }) => {
-        const result = await agent.store.list("deployment:", { limit });
-        const deployments = [];
-        for (const entry of result.entries) {
-          const deploymentData = await agent.store.get(entry.key);
-          if (deploymentData) {
-            deployments.push(JSON.parse(deploymentData));
-          }
+      execute: async ({ projectName, limit = 10 }) => {
+        if (!process.env.VERCEL_TOKEN) {
+          return { error: "VERCEL_TOKEN not configured" };
         }
-        // Sort by timestamp descending
-        deployments.sort((a: any, b: any) => b.timestamp - a.timestamp);
-        return { deployments };
+        
+        try {
+          // Build URL - if projectName provided, try to use it as filter
+          const teamParam = process.env.VERCEL_TEAM_ID ? `teamId=${process.env.VERCEL_TEAM_ID}&` : '';
+          let url = `https://api.vercel.com/v6/deployments?${teamParam}limit=${limit}`;
+          if (projectName) {
+            // Try to look up project ID from name
+            const projectsResponse = await fetch(
+              `https://api.vercel.com/v9/projects?${teamParam}limit=100`,
+              {
+                headers: {
+                  Authorization: `Bearer ${process.env.VERCEL_TOKEN}`,
+                },
+              }
+            );
+            
+            if (projectsResponse.ok) {
+              const projectsData = await projectsResponse.json() as any;
+              const project = projectsData.projects?.find((p: any) => 
+                p.name === projectName || p.name.includes(projectName)
+              );
+              
+              if (project) {
+                url = `https://api.vercel.com/v6/deployments?${teamParam}projectId=${project.id}&limit=${limit}`;
+              } else {
+                return { error: `Project '${projectName}' not found in your Vercel account` };
+              }
+            }
+          }
+          
+          // Fetch deployments from Vercel API
+          const response = await fetch(url, {
+            headers: {
+              Authorization: `Bearer ${process.env.VERCEL_TOKEN}`,
+            },
+          });
+          
+          if (!response.ok) {
+            const errorText = await response.text();
+            return { error: `Failed to fetch deployments: ${response.status} - ${errorText}` };
+          }
+          
+          const data = await response.json() as any;
+          
+          if (!data.deployments || data.deployments.length === 0) {
+            return { deployments: [], message: projectName ? `No deployments found for ${projectName}` : "No deployments found" };
+          }
+          
+          // Map to a cleaner format
+          const deployments = data.deployments.map((d: any) => ({
+            id: d.uid,
+            url: d.url,
+            state: d.state,
+            readyState: d.readyState,
+            target: d.target || 'preview',
+            projectName: d.name,
+            createdAt: new Date(d.createdAt).toISOString(),
+            creator: d.creator?.username,
+            gitBranch: d.meta?.githubCommitRef,
+            gitCommitSha: d.meta?.githubCommitSha?.substring(0, 7),
+            gitCommitMessage: d.meta?.githubCommitMessage,
+          }));
+          
+          return { deployments, total: deployments.length };
+        } catch (e) {
+          return { error: `Failed to fetch deployments: ${e}` };
+        }
       },
     }),
     configure_notifications: tool({
@@ -446,6 +506,50 @@ agent.on("chat", async ({ messages }) => {
         }
       },
     }),
+    list_vercel_projects: tool({
+      description: "List all Vercel projects in your account. Use this to discover available projects.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        if (!process.env.VERCEL_TOKEN) {
+          return { error: "VERCEL_TOKEN not configured" };
+        }
+        
+        try {
+          const teamParam = process.env.VERCEL_TEAM_ID ? `?teamId=${process.env.VERCEL_TEAM_ID}` : '';
+          const response = await fetch(
+            `https://api.vercel.com/v9/projects${teamParam}`,
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.VERCEL_TOKEN}`,
+              },
+            }
+          );
+          
+          if (!response.ok) {
+            const errorText = await response.text();
+            return { error: `Failed to fetch projects: ${response.status} - ${errorText}` };
+          }
+          
+          const data = await response.json() as any;
+          
+          if (!data.projects || data.projects.length === 0) {
+            return { projects: [], message: "No projects found in your Vercel account" };
+          }
+          
+          const projects = data.projects.map((p: any) => ({
+            id: p.id,
+            name: p.name,
+            framework: p.framework,
+            createdAt: new Date(p.createdAt).toISOString(),
+            updatedAt: new Date(p.updatedAt).toISOString(),
+          }));
+          
+          return { projects, total: projects.length };
+        } catch (e) {
+          return { error: `Failed to fetch projects: ${e}` };
+        }
+      },
+    }),
     get_deployment_logs: tool({
       description: "Fetch detailed build logs for a deployment. Use this when users ask about specific errors, warnings, or want to see what went wrong.",
       inputSchema: z.object({
@@ -458,8 +562,9 @@ agent.on("chat", async ({ messages }) => {
         
         try {
           // Fetch build logs
+          const teamParam = process.env.VERCEL_TEAM_ID ? `?teamId=${process.env.VERCEL_TEAM_ID}` : '';
           const logsResponse = await fetch(
-            `https://api.vercel.com/v2/deployments/${deploymentId}/events`,
+            `https://api.vercel.com/v2/deployments/${deploymentId}/events${teamParam}`,
             {
               headers: {
                 Authorization: `Bearer ${process.env.VERCEL_TOKEN}`,
